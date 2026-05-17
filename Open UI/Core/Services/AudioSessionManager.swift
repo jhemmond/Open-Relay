@@ -1,5 +1,6 @@
 import Foundation
 import AVFoundation
+import MediaPlayer
 import os.log
 
    /// Centralized AVAudioSession manager with interruption handling, route change
@@ -24,6 +25,9 @@ final class AudioSessionManager {
     /// Whether we're in an active voice call (affects deactivation behavior).
     private var isVoiceCallActive: Bool = false
 
+    /// Whether TTS is actively speaking (affects media session claiming on CarPlay).
+    private var isTTSSpeaking: Bool = false
+
     /// Callback fired when an interruption ends and playback should resume.
     var onInterruptionEnded: (() -> Void)?
 
@@ -34,6 +38,18 @@ final class AudioSessionManager {
     private var interruptionObserver: Any?
     private var routeChangeObserver: Any?
     private var mediaServicesResetObserver: Any?
+
+    // MARK: - Media Session (CarPlay Volume Knob Fix)
+
+    /// Prevents Swift from deallocating the MPRemoteCommand targets during TTS.
+    /// On CarPlay, turning the volume knob fires a media-session play command.
+    /// If our app doesn't claim the media session, iOS routes the command to the
+    /// previous media app (Spotify, Apple Music, etc.), which resumes playback.
+    /// These strong references keep the command targets alive while TTS is active.
+    private var playCommandTarget: MPRemoteCommand?
+    private var pauseCommandTarget: MPRemoteCommand?
+    private var changePlaybackPositionCommandTarget: MPRemoteCommand?
+    private var changePlaybackRateCommandTarget: MPRemoteCommand?
 
     // MARK: - Lifecycle
 
@@ -170,6 +186,14 @@ final class AudioSessionManager {
             // Output port override changed — re-apply routing
             onRouteChanged?()
 
+        case .volumeChange:
+            // CarPlay volume knob turn — reassert audio session focus to prevent
+            // background media from interpreting this as a play/resume command.
+            if isTTSSpeaking {
+                logger.info("Volume change during TTS — reasserting audio session")
+                reactivateSession()
+            }
+
         default:
             break
         }
@@ -193,6 +217,93 @@ final class AudioSessionManager {
                 }
             }
         }
+    }
+
+    // MARK: - Media Session Control (CarPlay)
+
+    /// Called by TextToSpeechService when TTS playback begins.
+    /// Claims the media session so CarPlay routes volume/play commands to this app
+    /// instead of background media (Spotify, Apple Music, etc.).
+    func mediaPlaybackStarted() {
+        isTTSSpeaking = true
+        claimMediaSession()
+    }
+
+    /// Called by TextToSpeechService when TTS playback ends.
+    /// Releases the media session so background media can resume normally.
+    func mediaPlaybackStopped() {
+        isTTSSpeaking = false
+        releaseMediaSession()
+    }
+
+    private func claimMediaSession() {
+        let center = MPRemoteCommandCenter.shared()
+
+        // Clear any previous targets first
+        releaseMediaSession()
+
+        // Set Now Playing info so iOS considers this app the active media player.
+        // Without this, CarPlay routes volume/play commands to the previous media app.
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = [
+            MPMediaItemPropertyTitle: "Open Relay",
+            MPMediaItemPropertyArtist: "Reading Aloud",
+            MPNowPlayingInfoPropertyElapsedPlaybackTime: 0.0,
+            MPMediaItemPropertyPlaybackDuration: 0,
+            MPNowPlayingInfoPropertyDefaultPlaybackRate: 1.0
+        ]
+
+        // Intercept the play command — CarPlay fires this when the volume knob is turned.
+        // By returning .success we consume the event so it doesn't propagate to background media.
+        playCommandTarget = center.playCommand
+        playCommandTarget?.removeTarget(self)
+        playCommandTarget?.addHandler { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.reactivateSession()
+            }
+            return MPRemoteCommandHandlerStatus.success
+        }
+
+        // Intercept pause command (e.g., user presses pause on CarPlay controls).
+        // We ignore it — TTS should only be stopped by the app itself.
+        pauseCommandTarget = center.pauseCommand
+        pauseCommandTarget?.removeTarget(self)
+        pauseCommandTarget?.addHandler { _ in
+            return MPRemoteCommandHandlerStatus.success
+        }
+
+        // Intercept position change (skip forward/back on CarPlay).
+        // TTS doesn't support seeking, so we consume the event silently.
+        changePlaybackPositionCommandTarget = center.changePlaybackPositionCommand
+        changePlaybackPositionCommandTarget?.removeTarget(self)
+        changePlaybackPositionCommandTarget?.addHandler { _ in
+            return MPRemoteCommandHandlerStatus.success
+        }
+
+        // Intercept playback rate change (CarPlay double-tap speed controls).
+        changePlaybackRateCommandTarget = center.changePlaybackRateCommand
+        changePlaybackRateCommandTarget?.removeTarget(self)
+        changePlaybackRateCommandTarget?.addHandler { _ in
+            return MPRemoteCommandHandlerStatus.success
+        }
+
+        logger.info("Media session claimed for TTS playback")
+    }
+
+    private func releaseMediaSession() {
+        let center = MPRemoteCommandCenter.shared()
+
+        playCommandTarget?.removeTarget(self)
+        playCommandTarget = nil
+        pauseCommandTarget?.removeTarget(self)
+        pauseCommandTarget = nil
+        changePlaybackPositionCommandTarget?.removeTarget(self)
+        changePlaybackPositionCommandTarget = nil
+        changePlaybackRateCommandTarget?.removeTarget(self)
+        changePlaybackRateCommandTarget = nil
+
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+
+        logger.info("Media session released")
     }
 
     // MARK: - Serial Configuration

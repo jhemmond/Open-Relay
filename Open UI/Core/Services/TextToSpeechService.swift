@@ -228,6 +228,8 @@ final class TextToSpeechService: NSObject {
                 self.state = .idle
                 self.isUsingKokoro = false
                 self.enableIdleTimer()
+                // Release media session and deactivate audio session.
+                self.deactivateAudioSession()
                 // Model stays loaded for fast re-use; unloaded only on background/explicit stop
                 self.onComplete?()
             }
@@ -436,6 +438,21 @@ final class TextToSpeechService: NSObject {
         isStreamingTTS = true
         streamingSpokenLength = 0
 
+        // Configure audio session for streaming. On CarPlay, use .duckOthers
+        // so background media doesn't hijack volume-knob events during TTS.
+        audioSessionManager?.configureSession { session in
+            let isCarPlay = session.currentRoute.outputs.contains { $0.portType == .carAudio }
+            let mixingOption: AVAudioSession.CategoryOptions = isCarPlay ? .duckOthers : .mixWithOthers
+            try session.setCategory(.playAndRecord, mode: .default,
+                                    options: [.defaultToSpeaker, .allowBluetoothHFP,
+                                              .allowBluetoothA2DP, mixingOption])
+            try session.setActive(true)
+        }
+
+        // Claim media session for CarPlay — streaming TTS may take time to
+        // produce audio, so claim early to prevent background media hijacking.
+        audioSessionManager?.mediaPlaybackStarted()
+
         // Tell the on-device queue pipeline to keep its audio session alive
         // while text is still being streamed — prevents premature pipeline exit
         // that causes pauses, skipped sentences, and double-generation.
@@ -488,6 +505,7 @@ final class TextToSpeechService: NSObject {
             // If TTS is already idle (no buffered audio), fire onComplete now.
             if !(isUsingKokoro && kokoroService.isPlaying) && !isUsingServer && !isSpeakingSystemChunk {
                 state = .idle
+                deactivateAudioSession()
                 onComplete?()
             }
             return
@@ -533,6 +551,19 @@ final class TextToSpeechService: NSObject {
         isUsingKokoro = true
         state = .speaking
         disableIdleTimer()
+
+        // Configure audio session before Kokoro's AVAudioPlayerNode starts playback.
+        // On CarPlay, use .duckOthers so background media doesn't hijack volume events.
+        audioSessionManager?.configureSession { [self] session in
+            let isCarPlay = session.currentRoute.outputs.contains { $0.portType == .carAudio }
+            let mixingOption: AVAudioSession.CategoryOptions = isCarPlay ? .duckOthers : .mixWithOthers
+            try session.setCategory(.playAndRecord, mode: .default,
+                                    options: [.defaultToSpeaker, .allowBluetoothHFP,
+                                              .allowBluetoothA2DP, mixingOption])
+            try session.setActive(true)
+        }
+
+        audioSessionManager?.mediaPlaybackStarted()
         Task {
             await kokoroService.speak(text)
         }
@@ -544,6 +575,7 @@ final class TextToSpeechService: NSObject {
         isUsingServer = true
         state = .speaking
         disableIdleTimer()
+        audioSessionManager?.mediaPlaybackStarted()
         onStart?()
         let sentences = TTSTextPreprocessor.splitIntoSentences(text)
         serverQueue.append(contentsOf: sentences)
@@ -579,19 +611,23 @@ final class TextToSpeechService: NSObject {
         // Voice calls use .voiceChat mode for echo cancellation + HFP mic routing.
         // All other TTS (chat read-aloud) uses the global baseline (.playAndRecord .default)
         // so it ignores the silent switch and mixes with other app audio.
+        // On CarPlay, use .duckOthers instead of .mixWithOthers so background media
+        // doesn't interpret volume-knob gestures as a play/resume command.
         audioSessionManager?.configureSession { [self] session in
+            let isCarPlay = session.currentRoute.outputs.contains { $0.portType == .carAudio }
+            let mixingOption: AVAudioSession.CategoryOptions = isCarPlay ? .duckOthers : .mixWithOthers
             if speakerOverride {
                 try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers])
+                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP, mixingOption])
                 try session.setActive(true)
                 // setActive resets overrideOutputAudioPort — re-apply the current routing preference.
                 try session.overrideOutputAudioPort(self.outputPortOverride)
             } else {
                 // Global baseline: .playAndRecord ignores silent switch; .defaultToSpeaker routes
-                // to loud speaker; .mixWithOthers doesn't interrupt other app audio.
+                // to loud speaker; .duckOthers/.mixWithOthers controls background media behavior.
                 try session.setCategory(.playAndRecord, mode: .default,
                                         options: [.defaultToSpeaker, .allowBluetoothHFP,
-                                                  .allowBluetoothA2DP, .mixWithOthers])
+                                                  .allowBluetoothA2DP, mixingOption])
                 try session.setActive(true)
             }
         }
@@ -734,6 +770,7 @@ final class TextToSpeechService: NSObject {
     private func speakWithSystem(_ text: String) {
         systemQueue.append(contentsOf: TTSTextPreprocessor.splitIntoSentences(text))
         if !isSpeakingSystemChunk {
+            audioSessionManager?.mediaPlaybackStarted()
             speakNextSystemChunk()
         }
     }
@@ -769,10 +806,12 @@ final class TextToSpeechService: NSObject {
         utterance.postUtteranceDelay = 0.05
 
         audioSessionManager?.configureSession { [self] session in
+            let isCarPlay = session.currentRoute.outputs.contains { $0.portType == .carAudio }
+            let mixingOption: AVAudioSession.CategoryOptions = isCarPlay ? .duckOthers : .mixWithOthers
             if speakerOverrideEnabled {
                 // Voice call — .voiceChat mode enables echo cancellation + HFP mic routing.
                 try session.setCategory(.playAndRecord, mode: .voiceChat,
-                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP, .mixWithOthers])
+                                        options: [.allowBluetoothHFP, .allowBluetoothA2DP, mixingOption])
                 try session.setActive(true)
                 // setActive resets overrideOutputAudioPort — re-apply earpiece/speaker preference.
                 try session.overrideOutputAudioPort(self.outputPortOverride)
@@ -780,7 +819,7 @@ final class TextToSpeechService: NSObject {
                 // Regular read-aloud — use global baseline so silent switch is ignored.
                 try session.setCategory(.playAndRecord, mode: .default,
                                         options: [.defaultToSpeaker, .allowBluetoothHFP,
-                                                  .allowBluetoothA2DP, .mixWithOthers])
+                                                  .allowBluetoothA2DP, mixingOption])
                 try session.setActive(true)
             }
         }
@@ -813,6 +852,9 @@ final class TextToSpeechService: NSObject {
     /// During voice calls, omits `.notifyOthersOnDeactivation` to prevent
     /// Spotify/music from resuming between listen/speak cycles.
     private func deactivateAudioSession() {
+        // Release the media session so background media can resume normally.
+        audioSessionManager?.mediaPlaybackStopped()
+
         let session = AVAudioSession.sharedInstance()
         let shouldNotify = audioSessionManager?.shouldNotifyOthersOnDeactivation ?? true
         if shouldNotify {
