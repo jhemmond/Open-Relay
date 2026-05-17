@@ -554,7 +554,7 @@ final class TextToSpeechService: NSObject {
 
         // Configure audio session before Kokoro's AVAudioPlayerNode starts playback.
         // On CarPlay, use .duckOthers so background media doesn't hijack volume events.
-        audioSessionManager?.configureSession { [self] session in
+        audioSessionManager?.configureSession { session in
             let isCarPlay = session.currentRoute.outputs.contains { $0.portType == .carAudio }
             let mixingOption: AVAudioSession.CategoryOptions = isCarPlay ? .duckOthers : .mixWithOthers
             try session.setCategory(.playAndRecord, mode: .default,

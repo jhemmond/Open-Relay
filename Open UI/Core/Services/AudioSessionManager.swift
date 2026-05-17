@@ -51,6 +51,12 @@ final class AudioSessionManager {
     private var changePlaybackPositionCommandTarget: MPRemoteCommand?
     private var changePlaybackRateCommandTarget: MPRemoteCommand?
 
+    /// Retained target actions to keep command handlers alive.
+    private var playCommandAction: MPRemoteCommandTargetAction?
+    private var pauseCommandAction: MPRemoteCommandTargetAction?
+    private var positionCommandAction: MPRemoteCommandTargetAction?
+    private var rateCommandAction: MPRemoteCommandTargetAction?
+
     // MARK: - Lifecycle
 
     func startListening() {
@@ -186,16 +192,18 @@ final class AudioSessionManager {
             // Output port override changed — re-apply routing
             onRouteChanged?()
 
-        case .volumeChange:
-            // CarPlay volume knob turn — reassert audio session focus to prevent
-            // background media from interpreting this as a play/resume command.
-            if isTTSSpeaking {
+        default:
+            break
+        }
+
+        // Volume change route reason (iOS 16.0+) — CarPlay volume knob turn.
+        // Reassert audio session focus to prevent background media from interpreting
+        // this as a play/resume command.
+        if #available(iOS 16.0, *) {
+            if reason == .volumeChange, isTTSSpeaking {
                 logger.info("Volume change during TTS — reasserting audio session")
                 reactivateSession()
             }
-
-        default:
-            break
         }
     }
 
@@ -255,50 +263,57 @@ final class AudioSessionManager {
         // Intercept the play command — CarPlay fires this when the volume knob is turned.
         // By returning .success we consume the event so it doesn't propagate to background media.
         playCommandTarget = center.playCommand
-        playCommandTarget?.removeTarget(self)
-        playCommandTarget?.addHandler { [weak self] _ in
+        playCommandTarget?.removeTarget(forEventHandler: nil)
+        playCommandAction = playCommandTarget?.addTarget { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.reactivateSession()
             }
-            return MPRemoteCommandHandlerStatus.success
+            return .success
         }
 
         // Intercept pause command (e.g., user presses pause on CarPlay controls).
         // We ignore it — TTS should only be stopped by the app itself.
         pauseCommandTarget = center.pauseCommand
-        pauseCommandTarget?.removeTarget(self)
-        pauseCommandTarget?.addHandler { _ in
-            return MPRemoteCommandHandlerStatus.success
+        pauseCommandTarget?.removeTarget(forEventHandler: nil)
+        pauseCommandAction = pauseCommandTarget?.addTarget { _ in
+            return .success
         }
 
         // Intercept position change (skip forward/back on CarPlay).
         // TTS doesn't support seeking, so we consume the event silently.
         changePlaybackPositionCommandTarget = center.changePlaybackPositionCommand
-        changePlaybackPositionCommandTarget?.removeTarget(self)
-        changePlaybackPositionCommandTarget?.addHandler { _ in
-            return MPRemoteCommandHandlerStatus.success
+        changePlaybackPositionCommandTarget?.removeTarget(forEventHandler: nil)
+        positionCommandAction = changePlaybackPositionCommandTarget?.addTarget { _ in
+            return .success
         }
 
         // Intercept playback rate change (CarPlay double-tap speed controls).
         changePlaybackRateCommandTarget = center.changePlaybackRateCommand
-        changePlaybackRateCommandTarget?.removeTarget(self)
-        changePlaybackRateCommandTarget?.addHandler { _ in
-            return MPRemoteCommandHandlerStatus.success
+        changePlaybackRateCommandTarget?.removeTarget(forEventHandler: nil)
+        rateCommandAction = changePlaybackRateCommandTarget?.addTarget { _ in
+            return .success
         }
 
         logger.info("Media session claimed for TTS playback")
     }
 
     private func releaseMediaSession() {
-        let center = MPRemoteCommandCenter.shared()
+        playCommandAction?.invalidate()
+        playCommandAction = nil
+        pauseCommandAction?.invalidate()
+        pauseCommandAction = nil
+        positionCommandAction?.invalidate()
+        positionCommandAction = nil
+        rateCommandAction?.invalidate()
+        rateCommandAction = nil
 
-        playCommandTarget?.removeTarget(self)
+        playCommandTarget?.removeTarget(forEventHandler: nil)
         playCommandTarget = nil
-        pauseCommandTarget?.removeTarget(self)
+        pauseCommandTarget?.removeTarget(forEventHandler: nil)
         pauseCommandTarget = nil
-        changePlaybackPositionCommandTarget?.removeTarget(self)
+        changePlaybackPositionCommandTarget?.removeTarget(forEventHandler: nil)
         changePlaybackPositionCommandTarget = nil
-        changePlaybackRateCommandTarget?.removeTarget(self)
+        changePlaybackRateCommandTarget?.removeTarget(forEventHandler: nil)
         changePlaybackRateCommandTarget = nil
 
         MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
